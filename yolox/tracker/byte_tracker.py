@@ -12,7 +12,17 @@ from .basetrack import BaseTrack, TrackState
 
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
-    def __init__(self, tlwh, score):
+    ENV_INFO_KEYS = [
+        "road_overlap",
+        "nearest_obstacle_px",
+        "nearest_obstacle_m",
+        "distance_to_wall_m",
+        "depth_m",
+        "ground_xy",
+        "timestamp",
+    ]
+
+    def __init__(self, tlwh, score, env_info=None):
 
         # wait activate
         self._tlwh = np.asarray(tlwh, dtype=np.float)
@@ -22,6 +32,7 @@ class STrack(BaseTrack):
 
         self.score = score
         self.tracklet_len = 0
+        self.env_info = self._normalize_env_info(env_info)
 
     def predict(self):
         mean_state = self.mean.copy()
@@ -67,6 +78,7 @@ class STrack(BaseTrack):
         if new_id:
             self.track_id = self.next_id()
         self.score = new_track.score
+        self.env_info = copy.deepcopy(new_track.env_info)
 
     def update(self, new_track, frame_id):
         """
@@ -86,6 +98,7 @@ class STrack(BaseTrack):
         self.is_activated = True
 
         self.score = new_track.score
+        self.env_info = copy.deepcopy(new_track.env_info)
 
     @property
     # @jit(nopython=True)
@@ -141,6 +154,16 @@ class STrack(BaseTrack):
     def __repr__(self):
         return 'OT_{}_({}-{})'.format(self.track_id, self.start_frame, self.end_frame)
 
+    @classmethod
+    def _normalize_env_info(cls, env_info):
+        normalized = {key: None for key in cls.ENV_INFO_KEYS}
+        if env_info is None or not isinstance(env_info, dict):
+            return normalized
+        for key in cls.ENV_INFO_KEYS:
+            if key in env_info:
+                normalized[key] = env_info[key]
+        return normalized
+
 
 class BYTETracker(object):
     def __init__(self, args, frame_rate=30):
@@ -156,7 +179,34 @@ class BYTETracker(object):
         self.max_time_lost = self.buffer_size
         self.kalman_filter = KalmanFilter()
 
-    def update(self, output_results, img_info, img_size):
+    @staticmethod
+    def _prepare_env_contexts(env_contexts, length):
+        if env_contexts is None:
+            return [None] * length
+        env_list = list(env_contexts)
+        if len(env_list) < length:
+            env_list.extend([None] * (length - len(env_list)))
+        return env_list[:length]
+
+    @staticmethod
+    def _select_env_contexts(env_contexts, mask):
+        true_count = int(np.count_nonzero(mask))
+        if env_contexts is None:
+            return [None] * true_count
+        return [
+            BYTETracker._extract_env_info(env_contexts[i]) if i < len(env_contexts) else None
+            for i, keep in enumerate(mask) if keep
+        ]
+
+    @staticmethod
+    def _extract_env_info(env_context):
+        if env_context is None:
+            return None
+        if isinstance(env_context, dict) and "env_info" in env_context:
+            return env_context.get("env_info")
+        return env_context
+
+    def update(self, output_results, img_info, img_size, env_contexts=None):
         self.frame_id += 1
         activated_starcks = []
         refind_stracks = []
@@ -173,6 +223,7 @@ class BYTETracker(object):
         img_h, img_w = img_info[0], img_info[1]
         scale = min(img_size[0] / float(img_h), img_size[1] / float(img_w))
         bboxes /= scale
+        env_contexts = self._prepare_env_contexts(env_contexts, len(bboxes))
 
         remain_inds = scores > self.args.track_thresh
         inds_low = scores > 0.1
@@ -183,11 +234,13 @@ class BYTETracker(object):
         dets = bboxes[remain_inds]
         scores_keep = scores[remain_inds]
         scores_second = scores[inds_second]
+        env_keep = self._select_env_contexts(env_contexts, remain_inds)
+        env_second = self._select_env_contexts(env_contexts, inds_second)
 
         if len(dets) > 0:
             '''Detections'''
-            detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                          (tlbr, s) in zip(dets, scores_keep)]
+            detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, env_info=env) for
+                          (tlbr, s, env) in zip(dets, scores_keep, env_keep)]
         else:
             detections = []
 
@@ -223,8 +276,8 @@ class BYTETracker(object):
         # association the untrack to the low score detections
         if len(dets_second) > 0:
             '''Detections'''
-            detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
-                          (tlbr, s) in zip(dets_second, scores_second)]
+            detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s, env_info=env) for
+                          (tlbr, s, env) in zip(dets_second, scores_second, env_second)]
         else:
             detections_second = []
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]

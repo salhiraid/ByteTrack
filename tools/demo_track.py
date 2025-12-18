@@ -1,8 +1,10 @@
 import argparse
+import json
 import os
 import os.path as osp
 import time
 import cv2
+import numpy as np
 import torch
 
 from loguru import logger
@@ -16,6 +18,15 @@ from yolox.tracking_utils.timer import Timer
 
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
+ENV_INFO_KEYS = [
+    "road_overlap",
+    "nearest_obstacle_px",
+    "nearest_obstacle_m",
+    "distance_to_wall_m",
+    "depth_m",
+    "ground_xy",
+    "timestamp",
+]
 
 
 def make_parser():
@@ -114,6 +125,28 @@ def write_results(filename, results):
     logger.info('save results to {}'.format(filename))
 
 
+def _to_serializable_value(value):
+    if value is None:
+        return None
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return [_to_serializable_value(v) for v in value]
+    return value
+
+
+def sanitize_env_info(env_info):
+    if not env_info:
+        return {}
+    sanitized = {}
+    for key in ENV_INFO_KEYS:
+        if key in env_info and env_info[key] is not None:
+            sanitized[key] = _to_serializable_value(env_info[key])
+    return sanitized
+
+
 class Predictor(object):
     def __init__(
         self,
@@ -184,6 +217,11 @@ def image_demo(predictor, vis_folder, current_time, args):
     tracker = BYTETracker(args, frame_rate=args.fps)
     timer = Timer()
     results = []
+    env_info_records = []
+    timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time) if args.save_result else None
+    if args.save_result:
+        save_folder = osp.join(vis_folder, timestamp)
+        os.makedirs(save_folder, exist_ok=True)
 
     for frame_id, img_path in enumerate(files, 1):
         outputs, img_info = predictor.inference(img_path, timer)
@@ -192,6 +230,7 @@ def image_demo(predictor, vis_folder, current_time, args):
             online_tlwhs = []
             online_ids = []
             online_scores = []
+            online_env_infos = []
             for t in online_targets:
                 tlwh = t.tlwh
                 tid = t.track_id
@@ -200,13 +239,23 @@ def image_demo(predictor, vis_folder, current_time, args):
                     online_tlwhs.append(tlwh)
                     online_ids.append(tid)
                     online_scores.append(t.score)
+                    online_env_infos.append(t.env_info)
                     # save results
                     results.append(
                         f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                     )
+                    env_info_records.append(
+                        {
+                            "frame": frame_id,
+                            "id": int(tid),
+                            "score": float(t.score),
+                            "env_info": sanitize_env_info(t.env_info),
+                        }
+                    )
             timer.toc()
             online_im = plot_tracking(
-                img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / timer.average_time
+                img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / timer.average_time,
+                env_infos=online_env_infos
             )
         else:
             timer.toc()
@@ -214,9 +263,6 @@ def image_demo(predictor, vis_folder, current_time, args):
 
         # result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
         if args.save_result:
-            timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-            save_folder = osp.join(vis_folder, timestamp)
-            os.makedirs(save_folder, exist_ok=True)
             cv2.imwrite(osp.join(save_folder, osp.basename(img_path)), online_im)
 
         if frame_id % 20 == 0:
@@ -231,6 +277,10 @@ def image_demo(predictor, vis_folder, current_time, args):
         with open(res_file, 'w') as f:
             f.writelines(results)
         logger.info(f"save results to {res_file}")
+        env_file = osp.join(vis_folder, f"{timestamp}_env_info.json")
+        with open(env_file, "w") as f:
+            json.dump(env_info_records, f, indent=2)
+        logger.info(f"save env info to {env_file}")
 
 
 def imageflow_demo(predictor, vis_folder, current_time, args):
@@ -253,6 +303,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
     timer = Timer()
     frame_id = 0
     results = []
+    env_info_records = []
     while True:
         if frame_id % 20 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
@@ -264,6 +315,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
                 online_tlwhs = []
                 online_ids = []
                 online_scores = []
+                online_env_infos = []
                 for t in online_targets:
                     tlwh = t.tlwh
                     tid = t.track_id
@@ -272,12 +324,22 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
                         online_tlwhs.append(tlwh)
                         online_ids.append(tid)
                         online_scores.append(t.score)
+                        online_env_infos.append(t.env_info)
                         results.append(
                             f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                         )
+                        env_info_records.append(
+                            {
+                                "frame": frame_id,
+                                "id": int(tid),
+                                "score": float(t.score),
+                                "env_info": sanitize_env_info(t.env_info),
+                            }
+                        )
                 timer.toc()
                 online_im = plot_tracking(
-                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time
+                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time,
+                    env_infos=online_env_infos
                 )
             else:
                 timer.toc()
@@ -296,6 +358,10 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
         with open(res_file, 'w') as f:
             f.writelines(results)
         logger.info(f"save results to {res_file}")
+        env_file = osp.join(vis_folder, f"{timestamp}_env_info.json")
+        with open(env_file, "w") as f:
+            json.dump(env_info_records, f, indent=2)
+        logger.info(f"save env info to {env_file}")
 
 
 def main(exp, args):
