@@ -98,6 +98,19 @@ def make_parser():
     )
     parser.add_argument('--min_box_area', type=float, default=10, help='filter out tiny boxes')
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
+    parser.add_argument(
+        "--road_gating_mode",
+        type=str,
+        default="soft",
+        choices=["off", "soft", "hard"],
+        help="How to apply road-overlap gating: 'soft' scales scores, 'hard' drops, 'off' disables gating.",
+    )
+    parser.add_argument(
+        "--road_overlap_thresh",
+        type=float,
+        default=0.3,
+        help="Minimum road-overlap ratio used by road gating.",
+    )
     return parser
 
 
@@ -145,6 +158,136 @@ def sanitize_env_info(env_info):
         if key in env_info and env_info[key] is not None:
             sanitized[key] = _to_serializable_value(env_info[key])
     return sanitized
+
+
+def _extract_road_mask(img_info):
+    if not isinstance(img_info, dict):
+        return None
+    for key in ["road_mask", "segmentation_mask", "seg_mask"]:
+        if key in img_info:
+            return img_info[key]
+    return None
+
+
+def _prepare_road_mask(img_info):
+    raw_mask = _extract_road_mask(img_info)
+    if raw_mask is None:
+        return None
+    try:
+        mask = np.array(raw_mask)
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        if mask.dtype != np.bool_:
+            mask = mask > 0
+        raw_img = img_info.get("raw_img")
+        if raw_img is not None and mask.shape[:2] != raw_img.shape[:2]:
+            mask = cv2.resize(mask.astype(np.uint8), (raw_img.shape[1], raw_img.shape[0]), interpolation=cv2.INTER_NEAREST)
+            mask = mask > 0
+        return mask
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Failed to prepare road mask, bypassing gating. Error: {exc}")
+        return None
+
+
+def _compute_road_overlap(detections, mask):
+    if mask is None or detections.size == 0:
+        return None
+    mask_h, mask_w = mask.shape[:2]
+    overlaps = []
+    for det in detections:
+        x0, y0, x1, y1 = det[:4]
+        x0i, y0i, x1i, y1i = map(int, [x0, y0, x1, y1])
+        x0i = np.clip(x0i, 0, mask_w)
+        x1i = np.clip(x1i, 0, mask_w)
+        y0i = np.clip(y0i, 0, mask_h)
+        y1i = np.clip(y1i, 0, mask_h)
+        if x1i <= x0i or y1i <= y0i:
+            overlaps.append(0.0)
+            continue
+        region = mask[y0i:y1i, x0i:x1i]
+        if region.size == 0:
+            overlaps.append(0.0)
+            continue
+        overlaps.append(float(np.count_nonzero(region)) / float(region.size))
+    return np.asarray(overlaps, dtype=np.float32)
+
+
+def _apply_road_gating(outputs, img_info, args):
+    if args.road_gating_mode == "off":
+        return outputs, None, None
+    if outputs is None or outputs[0] is None or outputs[0].shape[0] == 0:
+        return outputs, None, None
+
+    road_mask = _prepare_road_mask(img_info)
+    if road_mask is None:
+        return outputs, None, {"segmentation_available": False}
+
+    try:
+        det_tensor = outputs[0]
+        device = det_tensor.device if torch.is_tensor(det_tensor) else None
+        dets_np = det_tensor.detach().cpu().numpy()
+        overlaps = _compute_road_overlap(dets_np, road_mask)
+        if overlaps is None:
+            return outputs, None, {"segmentation_available": False}
+
+        threshold = max(args.road_overlap_thresh, 1e-6)
+        env_contexts = [{"env_info": {"road_overlap": float(ov)}} for ov in overlaps]
+
+        if args.road_gating_mode == "hard":
+            keep_mask = overlaps >= threshold
+            gated_np = dets_np[keep_mask]
+            env_contexts = [env_contexts[i] for i, keep in enumerate(keep_mask) if keep]
+            dropped = int(np.count_nonzero(~keep_mask))
+            kept = int(gated_np.shape[0])
+            below = int(np.count_nonzero(overlaps < threshold))
+        else:
+            scale = np.clip(overlaps / threshold, 0.0, 1.0)
+            gated_np = dets_np.copy()
+            gated_np[:, 4] = gated_np[:, 4] * scale
+            keep_mask = np.ones_like(scale, dtype=bool)
+            dropped = 0
+            kept = int(gated_np.shape[0])
+            below = int(np.count_nonzero(overlaps < threshold))
+            env_contexts = env_contexts  # keep alignment for soft mode
+
+        if torch.is_tensor(det_tensor):
+            gated_tensor = torch.from_numpy(gated_np).to(device=device, dtype=det_tensor.dtype)
+        else:
+            gated_tensor = gated_np
+
+        gated_outputs = list(outputs)
+        gated_outputs[0] = gated_tensor
+
+        stats = {
+            "mode": args.road_gating_mode,
+            "total": int(len(overlaps)),
+            "kept": kept,
+            "dropped": dropped,
+            "below_threshold": below,
+            "segmentation_available": True,
+        }
+        return gated_outputs, env_contexts, stats
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Road gating failed; continuing without gating. Error: {exc}")
+        return outputs, None, {"segmentation_available": False}
+
+
+def _log_gating_stats(frame_id, stats):
+    if not stats:
+        return
+    if not stats.get("segmentation_available", True):
+        logger.debug(f"Frame {frame_id}: segmentation unavailable, skipped road gating.")
+        return
+    logger.info(
+        "Frame {frame}: road gating mode={mode}, total={total}, kept={kept}, dropped={dropped}, below_thresh={below}".format(
+            frame=frame_id,
+            mode=stats.get("mode"),
+            total=stats.get("total"),
+            kept=stats.get("kept"),
+            dropped=stats.get("dropped"),
+            below=stats.get("below_threshold"),
+        )
+    )
 
 
 class Predictor(object):
@@ -225,8 +368,11 @@ def image_demo(predictor, vis_folder, current_time, args):
 
     for frame_id, img_path in enumerate(files, 1):
         outputs, img_info = predictor.inference(img_path, timer)
+        outputs, env_contexts, gating_stats = _apply_road_gating(outputs, img_info, args)
         if outputs[0] is not None:
-            online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+            online_targets = tracker.update(
+                outputs[0], [img_info['height'], img_info['width']], exp.test_size, env_contexts=env_contexts
+            )
             online_tlwhs = []
             online_ids = []
             online_scores = []
@@ -260,6 +406,8 @@ def image_demo(predictor, vis_folder, current_time, args):
         else:
             timer.toc()
             online_im = img_info['raw_img']
+
+        _log_gating_stats(frame_id, gating_stats)
 
         # result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
         if args.save_result:
@@ -310,8 +458,11 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
         ret_val, frame = cap.read()
         if ret_val:
             outputs, img_info = predictor.inference(frame, timer)
+            outputs, env_contexts, gating_stats = _apply_road_gating(outputs, img_info, args)
             if outputs[0] is not None:
-                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+                online_targets = tracker.update(
+                    outputs[0], [img_info['height'], img_info['width']], exp.test_size, env_contexts=env_contexts
+                )
                 online_tlwhs = []
                 online_ids = []
                 online_scores = []
@@ -344,6 +495,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             else:
                 timer.toc()
                 online_im = img_info['raw_img']
+            _log_gating_stats(frame_id + 1, gating_stats)
             if args.save_result:
                 vid_writer.write(online_im)
             ch = cv2.waitKey(1)
