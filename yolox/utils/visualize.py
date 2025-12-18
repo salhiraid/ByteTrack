@@ -49,7 +49,7 @@ def get_color(idx):
     return color
 
 
-def plot_tracking(image, tlwhs, obj_ids, scores=None, frame_id=0, fps=0., ids2=None):
+def plot_tracking(image, tlwhs, obj_ids, scores=None, frame_id=0, fps=0., ids2=None, env_infos=None):
     im = np.ascontiguousarray(np.copy(image))
     im_h, im_w = im.shape[:2]
 
@@ -66,6 +66,9 @@ def plot_tracking(image, tlwhs, obj_ids, scores=None, frame_id=0, fps=0., ids2=N
     cv2.putText(im, 'frame: %d fps: %.2f num: %d' % (frame_id, fps, len(tlwhs)),
                 (0, int(15 * text_scale)), cv2.FONT_HERSHEY_PLAIN, 2, (0, 0, 255), thickness=2)
 
+    if env_infos is None:
+        env_infos = [None] * len(tlwhs)
+
     for i, tlwh in enumerate(tlwhs):
         x1, y1, w, h = tlwh
         intbox = tuple(map(int, (x1, y1, x1 + w, y1 + h)))
@@ -77,7 +80,52 @@ def plot_tracking(image, tlwhs, obj_ids, scores=None, frame_id=0, fps=0., ids2=N
         cv2.rectangle(im, intbox[0:2], intbox[2:4], color=color, thickness=line_thickness)
         cv2.putText(im, id_text, (intbox[0], intbox[1]), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 0, 255),
                     thickness=text_thickness)
+        env_text_lines = _format_env_info(env_infos[i] if i < len(env_infos) else None)
+        env_text_scale = max(0.8, text_scale * 0.5)
+        for line_idx, line in enumerate(env_text_lines):
+            offset_y = intbox[1] + (line_idx + 1) * int(15 * env_text_scale)
+            cv2.putText(
+                im,
+                line,
+                (intbox[0], offset_y),
+                cv2.FONT_HERSHEY_PLAIN,
+                env_text_scale,
+                color,
+                thickness=max(1, text_thickness - 1),
+            )
     return im
+
+
+def _format_env_info(env_info):
+    if not env_info:
+        return []
+    env_keys = [
+        "road_overlap",
+        "nearest_obstacle_px",
+        "nearest_obstacle_m",
+        "distance_to_wall_m",
+        "depth_m",
+        "ground_xy",
+        "timestamp",
+    ]
+    formatted = []
+
+    def _format_value(value):
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            return "[" + ", ".join(_format_value(v) for v in value) + "]"
+        if isinstance(value, (float, int)):
+            return f"{value:.2f}"
+        return str(value)
+
+    for key in env_keys:
+        if env_info.get(key) is None:
+            continue
+        formatted.append(f"{key}:{_format_value(env_info.get(key))}")
+    return formatted
 
 
 _COLORS = np.array(
