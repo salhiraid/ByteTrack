@@ -5,6 +5,7 @@ import os.path as osp
 import copy
 import torch
 import torch.nn.functional as F
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from .kalman_filter import KalmanFilter
 from yolox.tracker import matching
@@ -33,11 +34,12 @@ class STrack(BaseTrack):
         self.score = score
         self.tracklet_len = 0
         self.env_info = self._normalize_env_info(env_info)
+        self.state_mode = getattr(self.shared_kalman, "state_mode", "2d")
 
     def predict(self):
         mean_state = self.mean.copy()
         if self.state != TrackState.Tracked:
-            mean_state[7] = 0
+            mean_state[self.kalman_filter._velocity_slice] = 0
         self.mean, self.covariance = self.kalman_filter.predict(mean_state, self.covariance)
 
     @staticmethod
@@ -47,7 +49,7 @@ class STrack(BaseTrack):
             multi_covariance = np.asarray([st.covariance for st in stracks])
             for i, st in enumerate(stracks):
                 if st.state != TrackState.Tracked:
-                    multi_mean[i][7] = 0
+                    multi_mean[i][st.kalman_filter._velocity_slice] = 0
             multi_mean, multi_covariance = STrack.shared_kalman.multi_predict(multi_mean, multi_covariance)
             for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
                 stracks[i].mean = mean
@@ -57,7 +59,7 @@ class STrack(BaseTrack):
         """Start a new tracklet"""
         self.kalman_filter = kalman_filter
         self.track_id = self.next_id()
-        self.mean, self.covariance = self.kalman_filter.initiate(self.tlwh_to_xyah(self._tlwh))
+        self.mean, self.covariance = self.kalman_filter.initiate(self._build_measurement(self._tlwh))
 
         self.tracklet_len = 0
         self.state = TrackState.Tracked
@@ -69,7 +71,7 @@ class STrack(BaseTrack):
 
     def re_activate(self, new_track, frame_id, new_id=False):
         self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_track.tlwh)
+            self.mean, self.covariance, self._build_measurement(new_track.tlwh)
         )
         self.tracklet_len = 0
         self.state = TrackState.Tracked
@@ -93,7 +95,7 @@ class STrack(BaseTrack):
 
         new_tlwh = new_track.tlwh
         self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_tlwh))
+            self.mean, self.covariance, self._build_measurement(new_tlwh))
         self.state = TrackState.Tracked
         self.is_activated = True
 
@@ -135,7 +137,7 @@ class STrack(BaseTrack):
         return ret
 
     def to_xyah(self):
-        return self.tlwh_to_xyah(self.tlwh)
+        return self._build_measurement(self.tlwh)
 
     @staticmethod
     # @jit(nopython=True)
@@ -164,6 +166,29 @@ class STrack(BaseTrack):
                 normalized[key] = env_info[key]
         return normalized
 
+    def _build_measurement(self, tlwh):
+        base = self.tlwh_to_xyah(tlwh)
+        extras = []
+        depth, ground_xy = self._extract_3d_components()
+        if self.state_mode in ("depth", "z"):
+            extras.append(0.0 if depth is None else depth)
+        elif self.state_mode == "ground":
+            gx, gy = (ground_xy or (0.0, 0.0))
+            extras.extend([gx, gy])
+            extras.append(0.0 if depth is None else depth)
+        if not extras:
+            return base
+        return np.concatenate([base, np.asarray(extras, dtype=np.float)])
+
+    def _extract_3d_components(self):
+        if not isinstance(self.env_info, dict):
+            return None, None
+        depth = self.env_info.get("depth_m")
+        ground_xy = self.env_info.get("ground_xy")
+        if ground_xy is not None:
+            ground_xy = tuple(ground_xy)
+        return depth, ground_xy
+
 
 class BYTETracker(object):
     def __init__(self, args, frame_rate=30):
@@ -177,7 +202,16 @@ class BYTETracker(object):
         self.det_thresh = args.track_thresh + 0.1
         self.buffer_size = int(frame_rate / 30.0 * args.track_buffer)
         self.max_time_lost = self.buffer_size
-        self.kalman_filter = KalmanFilter()
+        self.state_mode = getattr(args, "track_3d", "off")
+        if self.state_mode == "off":
+            self.state_mode = "2d"
+        elif self.state_mode == "z":
+            self.state_mode = "depth"
+        self.depth_weight = getattr(args, "depth_weight", 0.0)
+        self.depth_gate = getattr(args, "depth_gate", None)
+        self.project_ground = getattr(args, "project_ground", False) or self.state_mode == "ground"
+        self.kalman_filter = KalmanFilter(state_mode=self.state_mode)
+        STrack.shared_kalman = self.kalman_filter
 
     @staticmethod
     def _prepare_env_contexts(env_contexts, length):
@@ -206,7 +240,98 @@ class BYTETracker(object):
             return env_context.get("env_info")
         return env_context
 
-    def update(self, output_results, img_info, img_size, env_contexts=None):
+    @staticmethod
+    def _parse_intrinsics(camera_intrinsics):
+        if camera_intrinsics is None:
+            return None
+        matrix = np.asarray(camera_intrinsics, dtype=np.float32)
+        if matrix.size == 4:
+            fx, fy, cx, cy = matrix.reshape(-1)
+        elif matrix.size >= 9:
+            matrix = matrix.reshape(3, 3)
+            fx, fy, cx, cy = matrix[0, 0], matrix[1, 1], matrix[0, 2], matrix[1, 2]
+        else:
+            return None
+        return float(fx), float(fy), float(cx), float(cy)
+
+    def _compute_depth_env_infos(self, bboxes, img_info, frame_meta):
+        if frame_meta is None:
+            return [None] * len(bboxes)
+        depth_map = frame_meta.get("depth_map") if isinstance(frame_meta, dict) else None
+        if depth_map is None:
+            return [None] * len(bboxes)
+        camera_intrinsics = self._parse_intrinsics(frame_meta.get("camera_intrinsics"))
+        project_ground = frame_meta.get("project_ground", self.project_ground) if isinstance(frame_meta, dict) else self.project_ground
+        depth_scale = frame_meta.get("depth_scale", 1.0) if isinstance(frame_meta, dict) else 1.0
+        depth_map = np.asarray(depth_map)
+        if depth_map.ndim == 3:
+            depth_map = depth_map[:, :, 0]
+        if depth_map.size == 0:
+            return [None] * len(bboxes)
+
+        map_h, map_w = depth_map.shape[:2]
+        img_h, img_w = img_info[0], img_info[1]
+        scale_x = map_w / float(img_w)
+        scale_y = map_h / float(img_h)
+
+        env_infos = []
+        for bbox in bboxes:
+            cx = (bbox[0] + bbox[2]) / 2.0
+            foot_y = bbox[3]
+            sample_x = int(np.clip(round(cx * scale_x), 0, map_w - 1))
+            sample_y = int(np.clip(round(foot_y * scale_y), 0, map_h - 1))
+
+            patch = depth_map[max(0, sample_y - 1):min(map_h, sample_y + 2), max(0, sample_x - 1):min(map_w, sample_x + 2)]
+            valid = patch[np.isfinite(patch) & (patch > 0)]
+            if valid.size > 0:
+                depth_val = float(np.median(valid))
+            else:
+                depth_val = float(depth_map[sample_y, sample_x])
+            depth_val *= depth_scale
+            if not np.isfinite(depth_val) or depth_val <= 0:
+                env_infos.append(None)
+                continue
+
+            ground_xy = None
+            if camera_intrinsics is not None and project_ground:
+                fx, fy, cx_intr, cy_intr = camera_intrinsics
+                ground_x = (cx - cx_intr) * depth_val / fx
+                ground_y = (foot_y - cy_intr) * depth_val / fy
+                ground_xy = (ground_x, ground_y)
+
+            env_infos.append({"depth_m": depth_val, "ground_xy": ground_xy})
+        return env_infos
+
+    def _merge_env_info_contexts(self, env_contexts, computed_env_infos):
+        if computed_env_infos is None:
+            return env_contexts
+        if env_contexts is None:
+            env_contexts = [None] * len(computed_env_infos)
+        merged = []
+        max_len = max(len(env_contexts), len(computed_env_infos))
+        for idx in range(max_len):
+            base_env = self._extract_env_info(env_contexts[idx]) if idx < len(env_contexts) else None
+            computed_env = computed_env_infos[idx] if idx < len(computed_env_infos) else None
+            if base_env is None and computed_env is None:
+                merged.append(None)
+                continue
+            combined = {} if base_env is None else dict(base_env)
+            if computed_env is not None:
+                for key, value in computed_env.items():
+                    if value is not None:
+                        combined[key] = value
+            merged.append(combined)
+        return merged
+
+    def _apply_depth_cost(self, cost_matrix, tracks, detections):
+        if cost_matrix.size == 0 or self.depth_weight <= 0:
+            return cost_matrix
+        depth_cost = matching.depth_cost(
+            tracks, detections, gate=self.depth_gate, prefer_3d=self.state_mode == "ground"
+        )
+        return matching.fuse_depth_cost(cost_matrix, depth_cost, weight=self.depth_weight, gate=self.depth_gate)
+
+    def update(self, output_results, img_info, img_size, env_contexts=None, frame_meta=None):
         self.frame_id += 1
         activated_starcks = []
         refind_stracks = []
@@ -224,6 +349,8 @@ class BYTETracker(object):
         scale = min(img_size[0] / float(img_h), img_size[1] / float(img_w))
         bboxes /= scale
         env_contexts = self._prepare_env_contexts(env_contexts, len(bboxes))
+        computed_envs = self._compute_depth_env_infos(bboxes, [img_h, img_w], frame_meta)
+        env_contexts = self._merge_env_info_contexts(env_contexts, computed_envs)
 
         remain_inds = scores > self.args.track_thresh
         inds_low = scores > 0.1
@@ -258,6 +385,7 @@ class BYTETracker(object):
         # Predict the current location with KF
         STrack.multi_predict(strack_pool)
         dists = matching.iou_distance(strack_pool, detections)
+        dists = self._apply_depth_cost(dists, strack_pool, detections)
         if not self.args.mot20:
             dists = matching.fuse_score(dists, detections)
         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.args.match_thresh)
@@ -282,6 +410,7 @@ class BYTETracker(object):
             detections_second = []
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
         dists = matching.iou_distance(r_tracked_stracks, detections_second)
+        dists = self._apply_depth_cost(dists, r_tracked_stracks, detections_second)
         matches, u_track, u_detection_second = matching.linear_assignment(dists, thresh=0.5)
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
@@ -302,6 +431,7 @@ class BYTETracker(object):
         '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
         detections = [detections[i] for i in u_detection]
         dists = matching.iou_distance(unconfirmed, detections)
+        dists = self._apply_depth_cost(dists, unconfirmed, detections)
         if not self.args.mot20:
             dists = matching.fuse_score(dists, detections)
         matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, thresh=0.7)

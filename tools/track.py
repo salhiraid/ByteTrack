@@ -107,6 +107,19 @@ def make_parser():
     parser.add_argument("--match_thresh", type=float, default=0.9, help="matching threshold for tracking")
     parser.add_argument("--min-box-area", type=float, default=100, help='filter out tiny boxes')
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
+    parser.add_argument(
+        "--track_3d",
+        choices=["off", "z", "ground"],
+        default="off",
+        help="Kalman filter state uses depth (z) or ground-plane XYZ information.",
+    )
+    parser.add_argument("--depth_weight", type=float, default=0.0, help="Weight for depth/3D consistency in matching.")
+    parser.add_argument(
+        "--depth_gate",
+        type=float,
+        default=None,
+        help="Gate associations whose depth/3D distance exceeds this threshold (meters).",
+    )
     return parser
 
 

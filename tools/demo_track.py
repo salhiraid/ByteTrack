@@ -98,6 +98,43 @@ def make_parser():
     )
     parser.add_argument('--min_box_area', type=float, default=10, help='filter out tiny boxes')
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
+    parser.add_argument(
+        "--track_3d",
+        choices=["off", "z", "ground"],
+        default="off",
+        help="Kalman filter state uses depth (z) or ground-plane XYZ information."
+    )
+    parser.add_argument("--depth_weight", type=float, default=0.0, help="Weight for depth/3D consistency in matching.")
+    parser.add_argument(
+        "--depth_gate",
+        type=float,
+        default=None,
+        help="Gate associations whose depth/3D distance exceeds this threshold (meters).",
+    )
+    parser.add_argument(
+        "--depth_root",
+        type=str,
+        default=None,
+        help="Directory containing per-frame depth maps aligned to the RGB input.",
+    )
+    parser.add_argument(
+        "--depth_suffix",
+        type=str,
+        default=".npy",
+        help="File suffix for depth maps (e.g., .png, .npy).",
+    )
+    parser.add_argument(
+        "--camera_matrix",
+        type=str,
+        default=None,
+        help="Camera intrinsics as 'fx,fy,cx,cy' or path to a .npy/.json file.",
+    )
+    parser.add_argument("--depth_scale", type=float, default=1.0, help="Scale factor to convert raw depth to meters.")
+    parser.add_argument(
+        "--project_ground",
+        action="store_true",
+        help="Project footpoint depth samples to ground-plane X,Y using camera intrinsics.",
+    )
     return parser
 
 
@@ -145,6 +182,62 @@ def sanitize_env_info(env_info):
         if key in env_info and env_info[key] is not None:
             sanitized[key] = _to_serializable_value(env_info[key])
     return sanitized
+
+
+def _parse_camera_matrix_arg(arg):
+    if arg is None:
+        return None
+    if osp.isfile(arg):
+        ext = osp.splitext(arg)[1].lower()
+        if ext == ".json":
+            with open(arg, "r") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict) and "camera_matrix" in payload:
+                payload = payload["camera_matrix"]
+            return np.asarray(payload, dtype=np.float32)
+        return np.load(arg)
+    parts = arg.split(',')
+    if len(parts) == 4:
+        return np.asarray([float(p) for p in parts], dtype=np.float32)
+    logger.warning(f"Unable to parse camera_matrix argument: {arg}")
+    return None
+
+
+def _resolve_depth_path(img_path, args, frame_id=None):
+    if args.depth_root is None:
+        return None
+    candidates = []
+    if img_path is not None:
+        stem = osp.splitext(osp.basename(img_path))[0]
+        candidates.append(osp.join(args.depth_root, f"{stem}{args.depth_suffix}"))
+    if frame_id is not None:
+        candidates.append(osp.join(args.depth_root, f"{frame_id:06d}{args.depth_suffix}"))
+        candidates.append(osp.join(args.depth_root, f"{frame_id}{args.depth_suffix}"))
+    for cand in candidates:
+        if cand and osp.isfile(cand):
+            return cand
+    return None
+
+
+def _load_depth_map(depth_path):
+    if depth_path is None or not osp.isfile(depth_path):
+        return None
+    ext = osp.splitext(depth_path)[1].lower()
+    if ext == ".npy":
+        return np.load(depth_path)
+    depth = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH)
+    return depth
+
+
+def build_frame_meta(args, img_path=None, frame_id=None):
+    depth_path = _resolve_depth_path(img_path, args, frame_id)
+    depth_map = _load_depth_map(depth_path)
+    return {
+        "depth_map": depth_map,
+        "camera_intrinsics": args.camera_matrix,
+        "depth_scale": args.depth_scale,
+        "project_ground": args.project_ground,
+    }
 
 
 class Predictor(object):
@@ -225,8 +318,11 @@ def image_demo(predictor, vis_folder, current_time, args):
 
     for frame_id, img_path in enumerate(files, 1):
         outputs, img_info = predictor.inference(img_path, timer)
+        frame_meta = build_frame_meta(args, img_path=img_path, frame_id=frame_id)
         if outputs[0] is not None:
-            online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+            online_targets = tracker.update(
+                outputs[0], [img_info['height'], img_info['width']], exp.test_size, frame_meta=frame_meta
+            )
             online_tlwhs = []
             online_ids = []
             online_scores = []
@@ -310,8 +406,11 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
         ret_val, frame = cap.read()
         if ret_val:
             outputs, img_info = predictor.inference(frame, timer)
+            frame_meta = build_frame_meta(args, img_path=args.path if args.demo == "video" else None, frame_id=frame_id)
             if outputs[0] is not None:
-                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+                online_targets = tracker.update(
+                    outputs[0], [img_info['height'], img_info['width']], exp.test_size, frame_meta=frame_meta
+                )
                 online_tlwhs = []
                 online_ids = []
                 online_scores = []
@@ -367,6 +466,8 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
 def main(exp, args):
     if not args.experiment_name:
         args.experiment_name = exp.exp_name
+
+    args.camera_matrix = _parse_camera_matrix_arg(args.camera_matrix)
 
     output_dir = osp.join(exp.output_dir, args.experiment_name)
     os.makedirs(output_dir, exist_ok=True)

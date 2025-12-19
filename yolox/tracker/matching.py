@@ -132,7 +132,7 @@ def embedding_distance(tracks, detections, metric='cosine'):
 def gate_cost_matrix(kf, cost_matrix, tracks, detections, only_position=False):
     if cost_matrix.size == 0:
         return cost_matrix
-    gating_dim = 2 if only_position else 4
+    gating_dim = 2 if only_position else kf.ndim
     gating_threshold = kalman_filter.chi2inv95[gating_dim]
     measurements = np.asarray([det.to_xyah() for det in detections])
     for row, track in enumerate(tracks):
@@ -145,7 +145,7 @@ def gate_cost_matrix(kf, cost_matrix, tracks, detections, only_position=False):
 def fuse_motion(kf, cost_matrix, tracks, detections, only_position=False, lambda_=0.98):
     if cost_matrix.size == 0:
         return cost_matrix
-    gating_dim = 2 if only_position else 4
+    gating_dim = 2 if only_position else kf.ndim
     gating_threshold = kalman_filter.chi2inv95[gating_dim]
     measurements = np.asarray([det.to_xyah() for det in detections])
     for row, track in enumerate(tracks):
@@ -179,3 +179,57 @@ def fuse_score(cost_matrix, detections):
     fuse_sim = iou_sim * det_scores
     fuse_cost = 1 - fuse_sim
     return fuse_cost
+
+
+def _extract_depth_info(track_or_det):
+    env_info = getattr(track_or_det, "env_info", None)
+    if env_info is None or not isinstance(env_info, dict):
+        return None, None
+    depth = env_info.get("depth_m")
+    ground_xy = env_info.get("ground_xy")
+    if ground_xy is not None:
+        ground_xy = tuple(ground_xy)
+    return depth, ground_xy
+
+
+def depth_cost(tracks, detections, gate=None, prefer_3d=False):
+    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=np.float)
+    if cost_matrix.size == 0:
+        return cost_matrix
+
+    for i, track in enumerate(tracks):
+        track_depth, track_ground = _extract_depth_info(track)
+        for j, det in enumerate(detections):
+            det_depth, det_ground = _extract_depth_info(det)
+            if track_depth is None or det_depth is None:
+                cost_matrix[i, j] = 0
+                continue
+
+            if prefer_3d and track_ground is not None and det_ground is not None:
+                dx = track_ground[0] - det_ground[0]
+                dy = track_ground[1] - det_ground[1]
+                dz = track_depth - det_depth
+                diff = np.sqrt(dx * dx + dy * dy + dz * dz)
+            else:
+                diff = abs(track_depth - det_depth)
+
+            if gate is not None and diff > gate:
+                cost_matrix[i, j] = np.inf
+            else:
+                cost_matrix[i, j] = diff
+    return cost_matrix
+
+
+def fuse_depth_cost(cost_matrix, depth_cost_matrix, weight=0.0, gate=None):
+    if cost_matrix.size == 0 or weight <= 0:
+        return cost_matrix
+    fused = cost_matrix.copy()
+    finite_depth = depth_cost_matrix[np.isfinite(depth_cost_matrix)]
+    if finite_depth.size == 0:
+        return fused
+    normalizer = gate if gate is not None else float(np.max(finite_depth))
+    if normalizer <= 0:
+        normalizer = 1.0
+    normalized_depth = np.where(np.isfinite(depth_cost_matrix), depth_cost_matrix / normalizer, np.inf)
+    fused = fused + weight * normalized_depth
+    return fused
