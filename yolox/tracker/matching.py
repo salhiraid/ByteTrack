@@ -132,9 +132,17 @@ def embedding_distance(tracks, detections, metric='cosine'):
 def gate_cost_matrix(kf, cost_matrix, tracks, detections, only_position=False):
     if cost_matrix.size == 0:
         return cost_matrix
-    gating_dim = 2 if only_position else 4
-    gating_threshold = kalman_filter.chi2inv95[gating_dim]
-    measurements = np.asarray([det.to_xyah() for det in detections])
+    gating_dim = 2 if only_position else getattr(kf, "ndim", 4)
+    gating_threshold = kalman_filter.chi2inv95.get(gating_dim, kalman_filter.chi2inv95[4])
+    measurements = []
+    for det in detections:
+        if hasattr(det, "get_measurement"):
+            measurements.append(det.get_measurement(kf))
+        elif hasattr(det, "to_xyah"):
+            measurements.append(det.to_xyah())
+        else:
+            measurements.append(np.asarray(det))
+    measurements = np.asarray(measurements)
     for row, track in enumerate(tracks):
         gating_distance = kf.gating_distance(
             track.mean, track.covariance, measurements, only_position)
@@ -145,9 +153,17 @@ def gate_cost_matrix(kf, cost_matrix, tracks, detections, only_position=False):
 def fuse_motion(kf, cost_matrix, tracks, detections, only_position=False, lambda_=0.98):
     if cost_matrix.size == 0:
         return cost_matrix
-    gating_dim = 2 if only_position else 4
-    gating_threshold = kalman_filter.chi2inv95[gating_dim]
-    measurements = np.asarray([det.to_xyah() for det in detections])
+    gating_dim = 2 if only_position else getattr(kf, "ndim", 4)
+    gating_threshold = kalman_filter.chi2inv95.get(gating_dim, kalman_filter.chi2inv95[4])
+    measurements = []
+    for det in detections:
+        if hasattr(det, "get_measurement"):
+            measurements.append(det.get_measurement(kf))
+        elif hasattr(det, "to_xyah"):
+            measurements.append(det.to_xyah())
+        else:
+            measurements.append(np.asarray(det))
+    measurements = np.asarray(measurements)
     for row, track in enumerate(tracks):
         gating_distance = kf.gating_distance(
             track.mean, track.covariance, measurements, only_position, metric='maha')
@@ -179,3 +195,44 @@ def fuse_score(cost_matrix, detections):
     fuse_sim = iou_sim * det_scores
     fuse_cost = 1 - fuse_sim
     return fuse_cost
+
+
+def combine_costs(primary_cost, secondary_cost, secondary_weight):
+    if primary_cost.size == 0:
+        return primary_cost
+    weight = np.clip(secondary_weight, 0.0, 1.0)
+    if primary_cost.shape != secondary_cost.shape:
+        return primary_cost
+    return (1.0 - weight) * primary_cost + weight * secondary_cost
+
+
+def depth_distance(tracks, detections, max_depth_jump=5.0, default_cost=1.0):
+    cost_matrix = np.full((len(tracks), len(detections)), default_cost, dtype=np.float32)
+    if cost_matrix.size == 0:
+        return cost_matrix
+    for i, track in enumerate(tracks):
+        track_depth = getattr(track, "depth", None)
+        track_ground = None
+        if getattr(track, "env_info", None) is not None:
+            track_ground = track.env_info.get("ground_xy")
+        for j, det in enumerate(detections):
+            det_depth = getattr(det, "depth", None)
+            det_ground = None
+            if getattr(det, "env_info", None) is not None:
+                det_ground = det.env_info.get("ground_xy")
+            depth_diff = None if track_depth is None or det_depth is None else abs(track_depth - det_depth)
+            ground_diff = None
+            if track_ground is not None and det_ground is not None:
+                try:
+                    ground_diff = float(np.linalg.norm(np.asarray(track_ground, dtype=float) - np.asarray(det_ground, dtype=float)))
+                except Exception:
+                    ground_diff = None
+            if depth_diff is None and ground_diff is None:
+                continue
+            diff = depth_diff if ground_diff is None else (ground_diff if depth_diff is None else max(depth_diff, ground_diff))
+            if max_depth_jump is not None and diff > max_depth_jump:
+                cost_matrix[i, j] = np.inf
+            else:
+                denom = max(max_depth_jump, 1e-3) if max_depth_jump is not None else max(diff, 1e-3)
+                cost_matrix[i, j] = diff / denom
+    return cost_matrix

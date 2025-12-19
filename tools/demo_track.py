@@ -111,6 +111,23 @@ def make_parser():
         default=0.3,
         help="Minimum road-overlap ratio used by road gating.",
     )
+    parser.add_argument(
+        "--use_3d_state",
+        action="store_true",
+        help="Enable optional 3D-enriched Kalman state when depth and calibration inputs are available.",
+    )
+    parser.add_argument(
+        "--depth_weight",
+        type=float,
+        default=0.5,
+        help="Weight for the depth/3D consistency term during matching (0 disables).",
+    )
+    parser.add_argument(
+        "--depth_stride",
+        type=int,
+        default=1,
+        help="Stride/window size for sampling the depth map around detection footpoints. Scene-provided stride overrides this.",
+    )
     return parser
 
 
@@ -371,7 +388,7 @@ def image_demo(predictor, vis_folder, current_time, args):
         outputs, env_contexts, gating_stats = _apply_road_gating(outputs, img_info, args)
         if outputs[0] is not None:
             online_targets = tracker.update(
-                outputs[0], [img_info['height'], img_info['width']], exp.test_size, env_contexts=env_contexts
+                outputs[0], img_info, exp.test_size, env_contexts=env_contexts
             )
             online_tlwhs = []
             online_ids = []
@@ -461,7 +478,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             outputs, env_contexts, gating_stats = _apply_road_gating(outputs, img_info, args)
             if outputs[0] is not None:
                 online_targets = tracker.update(
-                    outputs[0], [img_info['height'], img_info['width']], exp.test_size, env_contexts=env_contexts
+                    outputs[0], img_info, exp.test_size, env_contexts=env_contexts
                 )
                 online_tlwhs = []
                 online_ids = []
