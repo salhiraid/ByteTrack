@@ -202,6 +202,16 @@ class BYTETracker(object):
         #self.det_thresh = args.track_thresh
         self.det_thresh = args.track_thresh + 0.1
         self.buffer_size = int(frame_rate / 30.0 * args.track_buffer)
+        self.base_buffer_size = self.buffer_size
+        self.max_buffer_scale = getattr(args, "max_buffer_scale", 2.0)
+        self.min_match_thresh = getattr(args, "min_match_thresh", 0.1)
+        self.buffer_crowd_weight = getattr(args, "buffer_crowd_weight", 1.0)
+        self.buffer_road_weight = getattr(args, "buffer_road_weight", 0.5)
+        self.match_relax_weight = getattr(args, "match_relax_weight", 0.5)
+        self.occluder_grace_frames = getattr(args, "occluder_grace_frames", self.buffer_size)
+        self.obstacle_px_threshold = getattr(args, "obstacle_px_threshold", 32.0)
+        self.obstacle_m_threshold = getattr(args, "obstacle_m_threshold", 1.0)
+        self.wall_proximity_threshold = getattr(args, "wall_proximity_threshold", 1.0)
         self.max_time_lost = self.buffer_size
         self.requested_3d_state = getattr(args, "use_3d_state", False)
         self.depth_weight = getattr(args, "depth_weight", 0.0)
@@ -313,6 +323,72 @@ class BYTETracker(object):
         return merged
 
     @staticmethod
+    def _mean_pairwise_iou(tracks):
+        active_tracks = [track for track in tracks if track.state in (TrackState.Tracked, TrackState.Lost)]
+        if len(active_tracks) < 2:
+            return 0.0
+        tlbrs = [track.tlbr for track in active_tracks]
+        iou_matrix = matching.ious(tlbrs, tlbrs)
+        if iou_matrix.size == 0:
+            return 0.0
+        upper = np.triu_indices(len(active_tracks), k=1)
+        pairwise = iou_matrix[upper]
+        if pairwise.size == 0:
+            return 0.0
+        return float(np.mean(pairwise))
+
+    @staticmethod
+    def _road_density(tracks, env_contexts):
+        densities = []
+        for track in tracks:
+            env = getattr(track, "env_info", None)
+            if env is None:
+                continue
+            road_overlap = env.get("road_overlap")
+            if road_overlap is not None:
+                densities.append(float(road_overlap))
+        if env_contexts:
+            for ctx in env_contexts:
+                env = BYTETracker._extract_env_info(ctx)
+                if env is None:
+                    continue
+                road_overlap = env.get("road_overlap")
+                if road_overlap is not None:
+                    densities.append(float(road_overlap))
+        if not densities:
+            return 0.0
+        return float(np.mean(densities))
+
+    def _compute_buffer_scale(self, crowding_iou, road_density):
+        crowd_term = self.buffer_crowd_weight * crowding_iou
+        road_term = self.buffer_road_weight * road_density
+        scale = 1.0 + crowd_term + road_term
+        return min(scale, self.max_buffer_scale)
+
+    def _compute_matching_threshold(self, base_thresh, scale_factor):
+        adjusted = base_thresh * (1.0 + self.match_relax_weight * (scale_factor - 1.0))
+        return max(self.min_match_thresh, adjusted)
+
+    def _is_near_occluder(self, track):
+        env = getattr(track, "env_info", None)
+        if env is None:
+            return False
+        obstacle_px = env.get("nearest_obstacle_px")
+        obstacle_m = env.get("nearest_obstacle_m")
+        wall_distance = env.get("distance_to_wall_m")
+        is_close_px = obstacle_px is not None and obstacle_px <= self.obstacle_px_threshold
+        is_close_m = obstacle_m is not None and obstacle_m <= self.obstacle_m_threshold
+        is_close_wall = wall_distance is not None and wall_distance <= self.wall_proximity_threshold
+        return bool(is_close_px or is_close_m or is_close_wall)
+
+    @staticmethod
+    def _log_track_event(track, event, frame_id, details=None):
+        message = f"Track {track.track_id} {event} at frame {frame_id}"
+        if details:
+            message = f"{message} ({details})"
+        logger.info(message)
+
+    @staticmethod
     def _depth_for_bbox(tlbr, depth_map, intrinsics, depth_scale=1.0, patch_size=1):
         if depth_map is None or intrinsics is None:
             return None
@@ -411,6 +487,24 @@ class BYTETracker(object):
         depth_patch = scene_depth_stride if scene_depth_stride is not None else self.depth_stride
         depth_envs = self._compute_depth_envs(bboxes, depth_map, intrinsics, depth_scale=depth_scale, patch_size=depth_patch)
 
+        crowding_iou = self._mean_pairwise_iou(self.tracked_stracks + self.lost_stracks)
+        road_density = self._road_density(self.tracked_stracks + self.lost_stracks, env_contexts)
+        buffer_scale = self._compute_buffer_scale(crowding_iou, road_density)
+        self.buffer_size = int(round(self.base_buffer_size * buffer_scale))
+        self.max_time_lost = self.buffer_size
+        primary_match_thresh = self._compute_matching_threshold(self.args.match_thresh, buffer_scale)
+        secondary_match_thresh = self._compute_matching_threshold(0.5, buffer_scale)
+        unconfirmed_match_thresh = self._compute_matching_threshold(0.7, buffer_scale)
+        logger.debug(
+            "Frame %s: crowding_iou=%.3f road_density=%.3f buffer_scale=%.2f buffer=%d match_thresh=%.3f",
+            self.frame_id,
+            crowding_iou,
+            road_density,
+            buffer_scale,
+            self.buffer_size,
+            primary_match_thresh,
+        )
+
         remain_inds = scores > self.args.track_thresh
         inds_low = scores > 0.1
         inds_high = scores < self.args.track_thresh
@@ -451,16 +545,18 @@ class BYTETracker(object):
             dists = matching.combine_costs(dists, depth_dists, self.depth_weight)
         if not self.args.mot20:
             dists = matching.fuse_score(dists, detections)
-        matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.args.match_thresh)
+        matches, u_track, u_detection = matching.linear_assignment(dists, thresh=primary_match_thresh)
 
         for itracked, idet in matches:
             track = strack_pool[itracked]
             det = detections[idet]
             if track.state == TrackState.Tracked:
                 track.update(detections[idet], self.frame_id)
+                self._log_track_event(track, "updated", self.frame_id, details="primary association")
                 activated_starcks.append(track)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
+                self._log_track_event(track, "reactivated", self.frame_id, details="primary association")
                 refind_stracks.append(track)
 
         ''' Step 3: Second association, with low score detection boxes'''
@@ -476,21 +572,24 @@ class BYTETracker(object):
         if self._active_3d and self.depth_weight > 0:
             depth_dists = matching.depth_distance(r_tracked_stracks, detections_second, max_depth_jump=self.depth_gate)
             dists = matching.combine_costs(dists, depth_dists, self.depth_weight)
-        matches, u_track, u_detection_second = matching.linear_assignment(dists, thresh=0.5)
+        matches, u_track, u_detection_second = matching.linear_assignment(dists, thresh=secondary_match_thresh)
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
             det = detections_second[idet]
             if track.state == TrackState.Tracked:
                 track.update(det, self.frame_id)
+                self._log_track_event(track, "updated", self.frame_id, details="secondary association")
                 activated_starcks.append(track)
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
+                self._log_track_event(track, "reactivated", self.frame_id, details="secondary association")
                 refind_stracks.append(track)
 
         for it in u_track:
             track = r_tracked_stracks[it]
             if not track.state == TrackState.Lost:
                 track.mark_lost()
+                self._log_track_event(track, "lost", self.frame_id)
                 lost_stracks.append(track)
 
         '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
@@ -501,13 +600,15 @@ class BYTETracker(object):
             dists = matching.combine_costs(dists, depth_dists, self.depth_weight)
         if not self.args.mot20:
             dists = matching.fuse_score(dists, detections)
-        matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, thresh=0.7)
+        matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, thresh=unconfirmed_match_thresh)
         for itracked, idet in matches:
             unconfirmed[itracked].update(detections[idet], self.frame_id)
+            self._log_track_event(unconfirmed[itracked], "confirmed", self.frame_id)
             activated_starcks.append(unconfirmed[itracked])
         for it in u_unconfirmed:
             track = unconfirmed[it]
             track.mark_removed()
+            self._log_track_event(track, "removed", self.frame_id, details="unconfirmed drop")
             removed_stracks.append(track)
 
         """ Step 4: Init new stracks"""
@@ -516,12 +617,18 @@ class BYTETracker(object):
             if track.score < self.det_thresh:
                 continue
             track.activate(self.kalman_filter, self.frame_id)
+            self._log_track_event(track, "activated", self.frame_id)
             activated_starcks.append(track)
         """ Step 5: Update state"""
         for track in self.lost_stracks:
-            if self.frame_id - track.end_frame > self.max_time_lost:
+            elapsed = self.frame_id - track.end_frame
+            grace = self.occluder_grace_frames if self._is_near_occluder(track) else 0
+            if elapsed > self.max_time_lost + grace:
                 track.mark_removed()
+                self._log_track_event(track, "removed", self.frame_id, details="time_exceeded")
                 removed_stracks.append(track)
+            elif grace > 0:
+                self._log_track_event(track, "grace_period", self.frame_id, details=f"elapsed={elapsed}, grace={grace}")
 
         # print('Ramained match {} s'.format(t4-t3))
 
