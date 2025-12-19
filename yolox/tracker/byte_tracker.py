@@ -5,6 +5,7 @@ import os.path as osp
 import copy
 import torch
 import torch.nn.functional as F
+from loguru import logger
 
 from .kalman_filter import KalmanFilter
 from yolox.tracker import matching
@@ -35,9 +36,11 @@ class STrack(BaseTrack):
         self.env_info = self._normalize_env_info(env_info)
 
     def predict(self):
+        if self.mean is None or self.kalman_filter is None:
+            return
         mean_state = self.mean.copy()
         if self.state != TrackState.Tracked:
-            mean_state[7] = 0
+            mean_state[self.kalman_filter.ndim:] = 0
         self.mean, self.covariance = self.kalman_filter.predict(mean_state, self.covariance)
 
     @staticmethod
@@ -47,7 +50,8 @@ class STrack(BaseTrack):
             multi_covariance = np.asarray([st.covariance for st in stracks])
             for i, st in enumerate(stracks):
                 if st.state != TrackState.Tracked:
-                    multi_mean[i][7] = 0
+                    vel_start = st.kalman_filter.ndim if st.kalman_filter is not None else STrack.shared_kalman.ndim
+                    multi_mean[i][vel_start:] = 0
             multi_mean, multi_covariance = STrack.shared_kalman.multi_predict(multi_mean, multi_covariance)
             for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
                 stracks[i].mean = mean
@@ -57,7 +61,8 @@ class STrack(BaseTrack):
         """Start a new tracklet"""
         self.kalman_filter = kalman_filter
         self.track_id = self.next_id()
-        self.mean, self.covariance = self.kalman_filter.initiate(self.tlwh_to_xyah(self._tlwh))
+        measurement = self.get_measurement(self.kalman_filter)
+        self.mean, self.covariance = self.kalman_filter.initiate(measurement)
 
         self.tracklet_len = 0
         self.state = TrackState.Tracked
@@ -68,8 +73,9 @@ class STrack(BaseTrack):
         self.start_frame = frame_id
 
     def re_activate(self, new_track, frame_id, new_id=False):
+        measurement = new_track.get_measurement(self.kalman_filter)
         self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_track.tlwh)
+            self.mean, self.covariance, measurement
         )
         self.tracklet_len = 0
         self.state = TrackState.Tracked
@@ -92,8 +98,9 @@ class STrack(BaseTrack):
         self.tracklet_len += 1
 
         new_tlwh = new_track.tlwh
+        measurement = new_track.get_measurement(self.kalman_filter)
         self.mean, self.covariance = self.kalman_filter.update(
-            self.mean, self.covariance, self.tlwh_to_xyah(new_tlwh))
+            self.mean, self.covariance, measurement)
         self.state = TrackState.Tracked
         self.is_activated = True
 
@@ -137,6 +144,25 @@ class STrack(BaseTrack):
     def to_xyah(self):
         return self.tlwh_to_xyah(self.tlwh)
 
+    def get_measurement(self, kalman_filter=None):
+        xyah = self.tlwh_to_xyah(self._tlwh)
+        kf = kalman_filter or self.kalman_filter
+        if kf is None or not kf.use_3d_state:
+            return xyah
+        depth_value = None if self.env_info is None else self.env_info.get("depth_m")
+        if depth_value is None:
+            logger.debug("3D state requested but depth is missing; using zero depth placeholder.")
+            depth_value = 0.0
+        return np.append(xyah, depth_value)
+
+    @property
+    def depth(self):
+        if self.mean is not None and self.kalman_filter is not None and self.kalman_filter.use_3d_state:
+            return float(self.mean[4])
+        if self.env_info and self.env_info.get("depth_m") is not None:
+            return float(self.env_info.get("depth_m"))
+        return None
+
     @staticmethod
     # @jit(nopython=True)
     def tlbr_to_tlwh(tlbr):
@@ -177,7 +203,15 @@ class BYTETracker(object):
         self.det_thresh = args.track_thresh + 0.1
         self.buffer_size = int(frame_rate / 30.0 * args.track_buffer)
         self.max_time_lost = self.buffer_size
-        self.kalman_filter = KalmanFilter()
+        self.requested_3d_state = getattr(args, "use_3d_state", False)
+        self.depth_weight = getattr(args, "depth_weight", 0.0)
+        self.depth_stride = getattr(args, "depth_stride", 1)
+        self.depth_gate = 5.0
+        self._active_3d = False
+        self._mode_initialized = False
+        self._mode_logged = False
+        self.kalman_filter = KalmanFilter(use_3d_state=False)
+        STrack.shared_kalman = KalmanFilter(use_3d_state=False)
 
     @staticmethod
     def _prepare_env_contexts(env_contexts, length):
@@ -206,6 +240,156 @@ class BYTETracker(object):
             return env_context.get("env_info")
         return env_context
 
+    @staticmethod
+    def _extract_intrinsics(img_info):
+        if not isinstance(img_info, dict):
+            return None
+        intrinsics = None
+        for key in ["intrinsics", "camera_intrinsics", "cam_intrinsic", "K"]:
+            if key in img_info:
+                intrinsics = img_info.get(key)
+                break
+        if intrinsics is None:
+            return None
+        try:
+            intrinsics_array = np.asarray(intrinsics)
+            if intrinsics_array.shape == (3, 3):
+                fx, fy, cx, cy = intrinsics_array[0, 0], intrinsics_array[1, 1], intrinsics_array[0, 2], intrinsics_array[1, 2]
+            elif intrinsics_array.size == 4:
+                fx, fy, cx, cy = intrinsics_array.flatten().tolist()
+            elif isinstance(intrinsics, dict):
+                fx, fy, cx, cy = (
+                    intrinsics.get("fx"),
+                    intrinsics.get("fy"),
+                    intrinsics.get("cx"),
+                    intrinsics.get("cy"),
+                )
+            else:
+                return None
+            if None in [fx, fy, cx, cy]:
+                return None
+            return {"fx": float(fx), "fy": float(fy), "cx": float(cx), "cy": float(cy)}
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_img_info(img_info):
+        depth_map = None
+        depth_stride = None
+        depth_scale = 1.0
+        intrinsics = None
+        if isinstance(img_info, dict):
+            img_h = img_info.get("height", None if "raw_img" not in img_info else img_info["raw_img"].shape[0])
+            img_w = img_info.get("width", None if "raw_img" not in img_info else img_info["raw_img"].shape[1])
+            depth_map = img_info.get("depth_map", img_info.get("depth"))
+            depth_stride = img_info.get("depth_stride")
+            depth_scale = img_info.get("depth_scale", 1.0)
+            intrinsics = BYTETracker._extract_intrinsics(img_info)
+        else:
+            img_h, img_w = img_info[0], img_info[1]
+        return img_h, img_w, depth_map, intrinsics, depth_stride, depth_scale
+
+    @staticmethod
+    def _merge_env_dicts(primary, secondary):
+        if primary is None and secondary is None:
+            return None
+        merged = {}
+        for item in [primary, secondary]:
+            if item is None:
+                continue
+            if isinstance(item, dict) and "env_info" in item:
+                merged.update(item.get("env_info", {}))
+            elif isinstance(item, dict):
+                merged.update(item)
+        return merged
+
+    @staticmethod
+    def _merge_env_lists(primary_list, secondary_list, mask):
+        selected_primary = BYTETracker._select_env_contexts(primary_list, mask)
+        selected_secondary = BYTETracker._select_env_contexts(secondary_list, mask)
+        merged = []
+        for primary, secondary in zip(selected_primary, selected_secondary):
+            merged.append(BYTETracker._merge_env_dicts(primary, secondary))
+        return merged
+
+    @staticmethod
+    def _depth_for_bbox(tlbr, depth_map, intrinsics, depth_scale=1.0, patch_size=1):
+        if depth_map is None or intrinsics is None:
+            return None
+        if hasattr(depth_map, "detach"):
+            depth_arr = depth_map.detach().cpu().numpy()
+        else:
+            depth_arr = np.asarray(depth_map)
+        if depth_arr.ndim == 3:
+            depth_arr = depth_arr[..., 0]
+        h, w = depth_arr.shape[:2]
+        x0, y0, x1, y1 = tlbr
+        foot_x = int(round((x0 + x1) / 2.0))
+        foot_y = int(round(y1))
+        if foot_x < 0 or foot_x >= w or foot_y < 0 or foot_y >= h:
+            return None
+        window = max(1, int(patch_size))
+        half = window // 2
+        x_start = max(0, foot_x - half)
+        x_end = min(w, foot_x + half + 1)
+        y_start = max(0, foot_y - half)
+        y_end = min(h, foot_y + half + 1)
+        patch = depth_arr[y_start:y_end, x_start:x_end]
+        valid = patch[np.isfinite(patch)]
+        valid = valid[valid > 0]
+        if valid.size == 0:
+            return None
+        depth_val = float(np.median(valid)) * float(depth_scale)
+        fx, fy, cx, cy = intrinsics["fx"], intrinsics["fy"], intrinsics["cx"], intrinsics["cy"]
+        ground_x = (foot_x - cx) / fx * depth_val
+        ground_y = (foot_y - cy) / fy * depth_val
+        return {"depth_m": depth_val, "ground_xy": (ground_x, ground_y)}
+
+    @staticmethod
+    def _compute_depth_envs(bboxes, depth_map, intrinsics, depth_scale=1.0, patch_size=1):
+        if depth_map is None or intrinsics is None:
+            return [None] * len(bboxes)
+        return [
+            BYTETracker._depth_for_bbox(box, depth_map, intrinsics, depth_scale=depth_scale, patch_size=patch_size)
+            for box in bboxes
+        ]
+
+    @staticmethod
+    def _has_complete_depth(env_infos):
+        if not env_infos:
+            return False
+        for info in env_infos:
+            if info is None:
+                return False
+            if info.get("depth_m") is None:
+                return False
+        return True
+
+    def _set_motion_model(self, use_3d):
+        if use_3d == self._active_3d and self.kalman_filter is not None:
+            return
+        self._active_3d = use_3d
+        self.kalman_filter = KalmanFilter(use_3d_state=use_3d)
+        STrack.shared_kalman = KalmanFilter(use_3d_state=use_3d)
+
+    def _maybe_initialize_mode(self, depth_map, intrinsics, env_infos):
+        if self._mode_initialized:
+            return
+        activate_3d = bool(self.requested_3d_state and depth_map is not None and intrinsics is not None)
+        if env_infos:
+            activate_3d = activate_3d and self._has_complete_depth(env_infos)
+        self._set_motion_model(activate_3d)
+        self._mode_initialized = True
+        if self._mode_logged:
+            return
+        if self._active_3d:
+            logger.info("3D-enriched tracking mode enabled (depth + calibration detected).")
+        elif self.requested_3d_state:
+            logger.info("Depth or calibration missing; defaulting to 2D tracking mode.")
+        else:
+            logger.info("2D tracking mode active (default).")
+        self._mode_logged = True
+
     def update(self, output_results, img_info, img_size, env_contexts=None):
         self.frame_id += 1
         activated_starcks = []
@@ -220,10 +404,12 @@ class BYTETracker(object):
             output_results = output_results.cpu().numpy()
             scores = output_results[:, 4] * output_results[:, 5]
             bboxes = output_results[:, :4]  # x1y1x2y2
-        img_h, img_w = img_info[0], img_info[1]
+        img_h, img_w, depth_map, intrinsics, scene_depth_stride, depth_scale = self._parse_img_info(img_info)
         scale = min(img_size[0] / float(img_h), img_size[1] / float(img_w))
         bboxes /= scale
         env_contexts = self._prepare_env_contexts(env_contexts, len(bboxes))
+        depth_patch = scene_depth_stride if scene_depth_stride is not None else self.depth_stride
+        depth_envs = self._compute_depth_envs(bboxes, depth_map, intrinsics, depth_scale=depth_scale, patch_size=depth_patch)
 
         remain_inds = scores > self.args.track_thresh
         inds_low = scores > 0.1
@@ -234,8 +420,10 @@ class BYTETracker(object):
         dets = bboxes[remain_inds]
         scores_keep = scores[remain_inds]
         scores_second = scores[inds_second]
-        env_keep = self._select_env_contexts(env_contexts, remain_inds)
-        env_second = self._select_env_contexts(env_contexts, inds_second)
+        env_keep = self._merge_env_lists(env_contexts, depth_envs, remain_inds)
+        env_second = self._merge_env_lists(env_contexts, depth_envs, inds_second)
+
+        self._maybe_initialize_mode(depth_map, intrinsics, env_keep + env_second)
 
         if len(dets) > 0:
             '''Detections'''
@@ -258,6 +446,9 @@ class BYTETracker(object):
         # Predict the current location with KF
         STrack.multi_predict(strack_pool)
         dists = matching.iou_distance(strack_pool, detections)
+        if self._active_3d and self.depth_weight > 0:
+            depth_dists = matching.depth_distance(strack_pool, detections, max_depth_jump=self.depth_gate)
+            dists = matching.combine_costs(dists, depth_dists, self.depth_weight)
         if not self.args.mot20:
             dists = matching.fuse_score(dists, detections)
         matches, u_track, u_detection = matching.linear_assignment(dists, thresh=self.args.match_thresh)
@@ -282,6 +473,9 @@ class BYTETracker(object):
             detections_second = []
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
         dists = matching.iou_distance(r_tracked_stracks, detections_second)
+        if self._active_3d and self.depth_weight > 0:
+            depth_dists = matching.depth_distance(r_tracked_stracks, detections_second, max_depth_jump=self.depth_gate)
+            dists = matching.combine_costs(dists, depth_dists, self.depth_weight)
         matches, u_track, u_detection_second = matching.linear_assignment(dists, thresh=0.5)
         for itracked, idet in matches:
             track = r_tracked_stracks[itracked]
@@ -302,6 +496,9 @@ class BYTETracker(object):
         '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
         detections = [detections[i] for i in u_detection]
         dists = matching.iou_distance(unconfirmed, detections)
+        if self._active_3d and self.depth_weight > 0:
+            depth_dists = matching.depth_distance(unconfirmed, detections, max_depth_jump=self.depth_gate)
+            dists = matching.combine_costs(dists, depth_dists, self.depth_weight)
         if not self.args.mot20:
             dists = matching.fuse_score(dists, detections)
         matches, u_unconfirmed, u_detection = matching.linear_assignment(dists, thresh=0.7)
