@@ -9,6 +9,7 @@ from loguru import logger
 
 from .kalman_filter import KalmanFilter
 from yolox.tracker import matching
+from .reid_encoder import ReIDEncoder
 from .basetrack import BaseTrack, TrackState
 
 class STrack(BaseTrack):
@@ -23,7 +24,7 @@ class STrack(BaseTrack):
         "timestamp",
     ]
 
-    def __init__(self, tlwh, score, env_info=None):
+    def __init__(self, tlwh, score, env_info=None, feat=None, smooth_feat=None):
 
         # wait activate
         self._tlwh = np.asarray(tlwh, dtype=np.float)
@@ -34,6 +35,9 @@ class STrack(BaseTrack):
         self.score = score
         self.tracklet_len = 0
         self.env_info = self._normalize_env_info(env_info)
+        self.curr_feat = feat
+        self.smooth_feat = smooth_feat
+        self.features = [] if feat is None else [feat]
 
     def predict(self):
         if self.mean is None or self.kalman_filter is None:
@@ -71,6 +75,7 @@ class STrack(BaseTrack):
         # self.is_activated = True
         self.frame_id = frame_id
         self.start_frame = frame_id
+        self.update_features(self.curr_feat)
 
     def re_activate(self, new_track, frame_id, new_id=False):
         measurement = new_track.get_measurement(self.kalman_filter)
@@ -85,6 +90,7 @@ class STrack(BaseTrack):
             self.track_id = self.next_id()
         self.score = new_track.score
         self.env_info = copy.deepcopy(new_track.env_info)
+        self.update_features(new_track.curr_feat)
 
     def update(self, new_track, frame_id):
         """
@@ -106,6 +112,7 @@ class STrack(BaseTrack):
 
         self.score = new_track.score
         self.env_info = copy.deepcopy(new_track.env_info)
+        self.update_features(new_track.curr_feat)
 
     @property
     # @jit(nopython=True)
@@ -190,6 +197,18 @@ class STrack(BaseTrack):
                 normalized[key] = env_info[key]
         return normalized
 
+    def update_features(self, feat, alpha=0.9):
+        if feat is None:
+            return
+        if self.smooth_feat is None:
+            self.smooth_feat = feat
+        else:
+            self.smooth_feat = alpha * self.smooth_feat + (1 - alpha) * feat
+        feat_norm = np.linalg.norm(self.smooth_feat) + 1e-12
+        self.smooth_feat = self.smooth_feat / feat_norm
+        self.curr_feat = feat
+        self.features.append(feat)
+
 
 class BYTETracker(object):
     def __init__(self, args, frame_rate=30):
@@ -207,6 +226,11 @@ class BYTETracker(object):
         self.depth_weight = getattr(args, "depth_weight", 0.0)
         self.depth_stride = getattr(args, "depth_stride", 1)
         self.depth_gate = 5.0
+        self.appearance_fuse = getattr(args, "appearance_fuse", False)
+        self.appearance_weight = getattr(args, "appearance_weight", 0.5)
+        self.reid_model_path = getattr(args, "reid_model", None)
+        self.reid_input_size = getattr(args, "reid_input_size", 128)
+        self._reid_encoder = None
         self._active_3d = False
         self._mode_initialized = False
         self._mode_logged = False
@@ -354,6 +378,17 @@ class BYTETracker(object):
             for box in bboxes
         ]
 
+    def _compute_embeddings(self, image, bboxes):
+        if image is None or not self.appearance_fuse:
+            return [None] * len(bboxes)
+        encoder = self._get_reid_encoder()
+        if encoder is None:
+            return [None] * len(bboxes)
+        embeddings = encoder(image, bboxes)
+        if embeddings is None:
+            return [None] * len(bboxes)
+        return embeddings
+
     @staticmethod
     def _has_complete_depth(env_infos):
         if not env_infos:
@@ -371,6 +406,22 @@ class BYTETracker(object):
         self._active_3d = use_3d
         self.kalman_filter = KalmanFilter(use_3d_state=use_3d)
         STrack.shared_kalman = KalmanFilter(use_3d_state=use_3d)
+
+    def _get_reid_encoder(self):
+        if self._reid_encoder is not None:
+            return self._reid_encoder
+        if not self.appearance_fuse:
+            return None
+        try:
+            self._reid_encoder = ReIDEncoder(
+                device=self.args.device if hasattr(self.args, "device") else None,
+                model_path=self.reid_model_path,
+                input_size=self.reid_input_size,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to initialize ReID encoder: {exc}")
+            self._reid_encoder = None
+        return self._reid_encoder
 
     def _maybe_initialize_mode(self, depth_map, intrinsics, env_infos):
         if self._mode_initialized:
@@ -397,6 +448,7 @@ class BYTETracker(object):
         lost_stracks = []
         removed_stracks = []
 
+        raw_img = img_info["raw_img"] if isinstance(img_info, dict) and "raw_img" in img_info else None
         if output_results.shape[1] == 5:
             scores = output_results[:, 4]
             bboxes = output_results[:, :4]
@@ -410,6 +462,7 @@ class BYTETracker(object):
         env_contexts = self._prepare_env_contexts(env_contexts, len(bboxes))
         depth_patch = scene_depth_stride if scene_depth_stride is not None else self.depth_stride
         depth_envs = self._compute_depth_envs(bboxes, depth_map, intrinsics, depth_scale=depth_scale, patch_size=depth_patch)
+        embeddings = self._compute_embeddings(raw_img, bboxes.tolist()) if len(bboxes) > 0 else []
 
         remain_inds = scores > self.args.track_thresh
         inds_low = scores > 0.1
@@ -422,13 +475,15 @@ class BYTETracker(object):
         scores_second = scores[inds_second]
         env_keep = self._merge_env_lists(env_contexts, depth_envs, remain_inds)
         env_second = self._merge_env_lists(env_contexts, depth_envs, inds_second)
+        feat_keep = [embeddings[i] for i, keep in enumerate(remain_inds) if keep] if embeddings else []
+        feat_second = [embeddings[i] for i, keep in enumerate(inds_second) if keep] if embeddings else []
 
         self._maybe_initialize_mode(depth_map, intrinsics, env_keep + env_second)
 
         if len(dets) > 0:
             '''Detections'''
-            detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, env_info=env) for
-                          (tlbr, s, env) in zip(dets, scores_keep, env_keep)]
+            detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s, env_info=env, feat=feat, smooth_feat=feat) for
+                          (tlbr, s, env, feat) in zip(dets, scores_keep, env_keep, feat_keep)]
         else:
             detections = []
 
@@ -446,6 +501,9 @@ class BYTETracker(object):
         # Predict the current location with KF
         STrack.multi_predict(strack_pool)
         dists = matching.iou_distance(strack_pool, detections)
+        if self.appearance_fuse:
+            app_cost = matching.embedding_distance(strack_pool, detections)
+            dists = matching.combine_costs(dists, app_cost, self.appearance_weight)
         if self._active_3d and self.depth_weight > 0:
             depth_dists = matching.depth_distance(strack_pool, detections, max_depth_jump=self.depth_gate)
             dists = matching.combine_costs(dists, depth_dists, self.depth_weight)
@@ -467,12 +525,15 @@ class BYTETracker(object):
         # association the untrack to the low score detections
         if len(dets_second) > 0:
             '''Detections'''
-            detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s, env_info=env) for
-                          (tlbr, s, env) in zip(dets_second, scores_second, env_second)]
+            detections_second = [STrack(STrack.tlbr_to_tlwh(tlbr), s, env_info=env, feat=feat, smooth_feat=feat) for
+                          (tlbr, s, env, feat) in zip(dets_second, scores_second, env_second, feat_second)]
         else:
             detections_second = []
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
         dists = matching.iou_distance(r_tracked_stracks, detections_second)
+        if self.appearance_fuse:
+            app_cost = matching.embedding_distance(r_tracked_stracks, detections_second)
+            dists = matching.combine_costs(dists, app_cost, self.appearance_weight)
         if self._active_3d and self.depth_weight > 0:
             depth_dists = matching.depth_distance(r_tracked_stracks, detections_second, max_depth_jump=self.depth_gate)
             dists = matching.combine_costs(dists, depth_dists, self.depth_weight)
@@ -496,6 +557,9 @@ class BYTETracker(object):
         '''Deal with unconfirmed tracks, usually tracks with only one beginning frame'''
         detections = [detections[i] for i in u_detection]
         dists = matching.iou_distance(unconfirmed, detections)
+        if self.appearance_fuse:
+            app_cost = matching.embedding_distance(unconfirmed, detections)
+            dists = matching.combine_costs(dists, app_cost, self.appearance_weight)
         if self._active_3d and self.depth_weight > 0:
             depth_dists = matching.depth_distance(unconfirmed, detections, max_depth_jump=self.depth_gate)
             dists = matching.combine_costs(dists, depth_dists, self.depth_weight)

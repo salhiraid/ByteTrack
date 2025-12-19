@@ -118,14 +118,27 @@ def embedding_distance(tracks, detections, metric='cosine'):
     :return: cost_matrix np.ndarray
     """
 
-    cost_matrix = np.zeros((len(tracks), len(detections)), dtype=np.float)
-    if cost_matrix.size == 0:
-        return cost_matrix
-    det_features = np.asarray([track.curr_feat for track in detections], dtype=np.float)
-    #for i, track in enumerate(tracks):
-        #cost_matrix[i, :] = np.maximum(0.0, cdist(track.smooth_feat.reshape(1,-1), det_features, metric))
-    track_features = np.asarray([track.smooth_feat for track in tracks], dtype=np.float)
-    cost_matrix = np.maximum(0.0, cdist(track_features, det_features, metric))  # Nomalized features
+    if len(tracks) == 0 or len(detections) == 0:
+        return np.zeros((len(tracks), len(detections)), dtype=np.float32)
+    det_features, det_indices = [], []
+    for i, det in enumerate(detections):
+        if getattr(det, "curr_feat", None) is not None:
+            det_features.append(det.curr_feat)
+            det_indices.append(i)
+    track_features, track_indices = [], []
+    for i, track in enumerate(tracks):
+        if getattr(track, "smooth_feat", None) is not None:
+            track_features.append(track.smooth_feat)
+            track_indices.append(i)
+    if len(track_features) == 0 or len(det_features) == 0:
+        return None
+    cost_matrix = np.full((len(tracks), len(detections)), 1.0, dtype=np.float32)
+    track_mat = np.asarray(track_features, dtype=np.float32)
+    det_mat = np.asarray(det_features, dtype=np.float32)
+    partial_cost = np.maximum(0.0, cdist(track_mat, det_mat, metric))
+    for i, row_idx in enumerate(track_indices):
+        for j, col_idx in enumerate(det_indices):
+            cost_matrix[row_idx, col_idx] = partial_cost[i, j]
     return cost_matrix
 
 
@@ -198,6 +211,8 @@ def fuse_score(cost_matrix, detections):
 
 
 def combine_costs(primary_cost, secondary_cost, secondary_weight):
+    if secondary_cost is None:
+        return primary_cost
     if primary_cost.size == 0:
         return primary_cost
     weight = np.clip(secondary_weight, 0.0, 1.0)

@@ -107,6 +107,31 @@ def make_parser():
     parser.add_argument("--match_thresh", type=float, default=0.9, help="matching threshold for tracking")
     parser.add_argument("--min-box-area", type=float, default=100, help='filter out tiny boxes')
     parser.add_argument("--mot20", dest="mot20", default=False, action="store_true", help="test mot20.")
+    parser.add_argument(
+        "--appearance-fuse",
+        dest="appearance_fuse",
+        action="store_true",
+        help="Enable appearance (ReID) fusion in matching.",
+    )
+    parser.add_argument(
+        "--appearance-weight",
+        dest="appearance_weight",
+        type=float,
+        default=0.5,
+        help="Weight for blending appearance (cosine) distance with IoU.",
+    )
+    parser.add_argument(
+        "--reid-model",
+        type=str,
+        default=None,
+        help="Optional path to ReID encoder weights. If not set, ImageNet-pretrained MobileNetV2 is used.",
+    )
+    parser.add_argument(
+        "--reid-input-size",
+        type=int,
+        default=128,
+        help="Square crop size used by the lightweight ReID encoder.",
+    )
     return parser
 
 
