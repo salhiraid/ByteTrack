@@ -7,16 +7,19 @@ struct Object
     cv::Rect_<float> rect;
     int label;
     float prob;
+    cv::Point3f gp = cv::Point3f(0.0F, 0.0F, 0.0F);
 };
 
 class BYTETracker
 {
 public:
 	BYTETracker(int frame_rate = 30, int track_buffer = 30);
-	~BYTETracker();
+	virtual ~BYTETracker();
 
-	vector<STrack> update(const vector<Object>& objects);
+	virtual vector<STrack> update(const vector<Object>& objects);
 	Scalar get_color(int idx);
+	const vector<STrack>& get_tracked_stracks() const;
+	const vector<STrack>& get_lost_stracks() const;
 
 private:
 	vector<STrack*> joint_stracks(vector<STrack*> &tlista, vector<STrack> &tlistb);

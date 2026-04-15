@@ -51,7 +51,7 @@ vector<STrack> BYTETracker::update(const vector<Object>& objects)
 
 			float score = objects[i].prob;
 
-			STrack strack(STrack::tlbr_to_tlwh(tlbr_), score);
+			STrack strack(STrack::tlbr_to_tlwh(tlbr_), score, objects[i].label, objects[i].gp);
 			if (score >= track_thresh)
 			{
 				detections.push_back(strack);
@@ -238,4 +238,14 @@ vector<STrack> BYTETracker::update(const vector<Object>& objects)
 		}
 	}
 	return output_stracks;
+}
+
+const vector<STrack>& BYTETracker::get_tracked_stracks() const
+{
+	return tracked_stracks;
+}
+
+const vector<STrack>& BYTETracker::get_lost_stracks() const
+{
+	return lost_stracks;
 }

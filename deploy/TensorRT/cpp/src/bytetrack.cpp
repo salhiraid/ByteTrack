@@ -9,7 +9,7 @@
 #include "NvInfer.h"
 #include "cuda_runtime_api.h"
 #include "logging.h"
-#include "BYTETracker.h"
+#include "BirdEyeViewTracker.h"
 
 #define CHECK(status) \
     do\
@@ -444,7 +444,7 @@ int main(int argc, char** argv) {
     VideoWriter writer("demo.mp4", VideoWriter::fourcc('m', 'p', '4', 'v'), fps, Size(img_w, img_h));
 
     Mat img;
-    BYTETracker tracker(fps, 30);
+    BirdEyeViewTracker tracker(fps, 30, "bev_outputs", -30.0F, 60.0F, 1000, 1000);
     int num_frames = 0;
     int total_ms = 0;
 	while (true)
