@@ -1,6 +1,6 @@
 #include "STrack.h"
 
-STrack::STrack(vector<float> tlwh_, float score)
+STrack::STrack(vector<float> tlwh_, float score, int class_id, vector<float> gp)
 {
 	_tlwh.resize(4);
 	_tlwh.assign(tlwh_.begin(), tlwh_.end());
@@ -17,6 +17,10 @@ STrack::STrack(vector<float> tlwh_, float score)
 	frame_id = 0;
 	tracklet_len = 0;
 	this->score = score;
+	this->class_id = class_id;
+	this->gp = gp;
+	if (this->gp.size() < 2)
+		this->gp.assign(2, 0.0F);
 	start_frame = 0;
 }
 
@@ -78,6 +82,8 @@ void STrack::re_activate(STrack &new_track, int frame_id, bool new_id)
 	this->is_activated = true;
 	this->frame_id = frame_id;
 	this->score = new_track.score;
+	this->class_id = new_track.class_id;
+	this->gp = new_track.gp;
 	if (new_id)
 		this->track_id = next_id();
 }
@@ -105,6 +111,8 @@ void STrack::update(STrack &new_track, int frame_id)
 	this->is_activated = true;
 
 	this->score = new_track.score;
+	this->class_id = new_track.class_id;
+	this->gp = new_track.gp;
 }
 
 void STrack::static_tlwh()

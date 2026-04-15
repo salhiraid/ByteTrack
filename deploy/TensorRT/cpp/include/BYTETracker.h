@@ -1,6 +1,9 @@
 #pragma once
 
 #include "STrack.h"
+#include <memory>
+
+class BirdEyeViewRenderer;
 
 struct Object
 {
@@ -13,10 +16,19 @@ class BYTETracker
 {
 public:
 	BYTETracker(int frame_rate = 30, int track_buffer = 30);
-	~BYTETracker();
+	virtual ~BYTETracker();
 
-	vector<STrack> update(const vector<Object>& objects);
+	virtual vector<STrack> update(const vector<Object>& objects);
 	Scalar get_color(int idx);
+	const vector<STrack>& get_tracked_stracks() const;
+	const vector<STrack>& get_lost_stracks() const;
+	void enable_bev_mapping(const string& output_dir,
+	                        float y_min_m,
+	                        float y_max_m,
+	                        int canvas_width = 900,
+	                        int canvas_height = 900,
+	                        int padding_px = 50,
+	                        int grid_step_m = 10);
 
 private:
 	vector<STrack*> joint_stracks(vector<STrack*> &tlista, vector<STrack> &tlistb);
@@ -46,4 +58,6 @@ private:
 	vector<STrack> lost_stracks;
 	vector<STrack> removed_stracks;
 	byte_kalman::KalmanFilter kalman_filter;
+	std::unique_ptr<BirdEyeViewRenderer> bev_renderer;
+	int bev_frame_index;
 };
