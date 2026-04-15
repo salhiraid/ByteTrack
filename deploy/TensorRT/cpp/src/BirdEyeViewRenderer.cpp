@@ -192,8 +192,10 @@ void BirdEyeViewRenderer::drawGridAndAxes(cv::Mat& canvas) const {
 }
 
 void BirdEyeViewRenderer::drawTrackPoint(cv::Mat& canvas, const STrack& track, int frame_index) {
+    const float gp_x = track.gp.size() > 0 ? track.gp[0] : 0.0F;
+    const float gp_y = track.gp.size() > 1 ? track.gp[1] : 0.0F;
     bool inside = false;
-    const cv::Point2i pixel = worldToImage(track.gp.x, track.gp.y, &inside);
+    const cv::Point2i pixel = worldToImage(gp_x, gp_y, &inside);
     const cv::Scalar color = getTrackColor(track.track_id);
 
     BEVRenderedTrackInfo rendered;

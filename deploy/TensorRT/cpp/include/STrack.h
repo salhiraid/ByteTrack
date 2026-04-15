@@ -11,7 +11,7 @@ enum TrackState { New = 0, Tracked, Lost, Removed };
 class STrack
 {
 public:
-	STrack(vector<float> tlwh_, float score, int class_id = -1, cv::Point3f gp = cv::Point3f(0.0F, 0.0F, 0.0F));
+	STrack(vector<float> tlwh_, float score, int class_id = -1, vector<float> gp = vector<float>(2, 0.0F));
 	~STrack();
 
 	vector<float> static tlbr_to_tlwh(vector<float> &tlbr);
@@ -45,7 +45,7 @@ public:
 	KAL_COVA covariance;
 	float score;
 	int class_id;
-	cv::Point3f gp;
+	vector<float> gp;
 
 private:
 	byte_kalman::KalmanFilter kalman_filter;

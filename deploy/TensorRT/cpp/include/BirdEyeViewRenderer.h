@@ -12,7 +12,7 @@ struct BEVRenderedTrackInfo {
     int frame_index = -1;
     int track_id = -1;
     int class_id = -1;
-    cv::Point3f gp = cv::Point3f(0.0F, 0.0F, 0.0F);
+    std::vector<float> gp = std::vector<float>(2, 0.0F);
     cv::Point2i bev_pixel = cv::Point2i(-1, -1);
     bool inside_bev = false;
     int track_state = TrackState::Tracked;

@@ -7,7 +7,6 @@ struct Object
     cv::Rect_<float> rect;
     int label;
     float prob;
-    cv::Point3f gp = cv::Point3f(0.0F, 0.0F, 0.0F);
 };
 
 class BYTETracker

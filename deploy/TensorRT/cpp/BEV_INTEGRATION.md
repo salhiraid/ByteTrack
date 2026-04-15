@@ -1,12 +1,11 @@
 # BirdEyeViewTracker integration example
 
-`BirdEyeViewTracker` is a child class of `BYTETracker` and now feeds BEV rendering using
-ByteTrack state containers directly:
+`BirdEyeViewTracker` is a child class of `BYTETracker` and feeds BEV rendering directly with:
 
 - `vector<STrack> tracked_stracks`
 - `vector<STrack> lost_stracks`
 
-No object-level BEV adapter is needed.
+No object-level BEV input is used.
 
 ```cpp
 #include "BirdEyeViewTracker.h"
@@ -23,10 +22,16 @@ BirdEyeViewTracker tracker(
 vector<STrack> output_stracks = tracker.update(objects);
 ```
 
-Internally, after each `update(...)`, the subclass calls:
+## Ground point format in `STrack`
+
+The BEV renderer reads `STrack::gp` directly, where `gp` is a `std::vector<float>`
+of size 2 containing world coordinates:
+
+- `gp[0]` -> `x` (meters)
+- `gp[1]` -> `y` (meters)
+
+Internally after each update:
 
 ```cpp
 bev_renderer_.renderFrame(get_tracked_stracks(), get_lost_stracks(), bev_frame_index_);
 ```
-
-So BEV rendering operates directly on `STrack` instances (tracked + lost).

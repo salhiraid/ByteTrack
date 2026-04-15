@@ -1,6 +1,6 @@
 #include "STrack.h"
 
-STrack::STrack(vector<float> tlwh_, float score, int class_id, cv::Point3f gp)
+STrack::STrack(vector<float> tlwh_, float score, int class_id, vector<float> gp)
 {
 	_tlwh.resize(4);
 	_tlwh.assign(tlwh_.begin(), tlwh_.end());
@@ -19,6 +19,8 @@ STrack::STrack(vector<float> tlwh_, float score, int class_id, cv::Point3f gp)
 	this->score = score;
 	this->class_id = class_id;
 	this->gp = gp;
+	if (this->gp.size() < 2)
+		this->gp.assign(2, 0.0F);
 	start_frame = 0;
 }
 
