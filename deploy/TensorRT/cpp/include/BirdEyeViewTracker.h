@@ -21,11 +21,6 @@ public:
     BirdEyeViewRenderer& renderer();
 
 private:
-    void appendTracksToBevInput(const vector<STrack>& tracks,
-                                int expected_state,
-                                vector<BEVTrackPoint>& bev_tracks) const;
-
-private:
     BirdEyeViewRenderer bev_renderer_;
     int bev_frame_index_;
 };

@@ -17,14 +17,8 @@ BirdEyeViewTracker::BirdEyeViewTracker(int frame_rate,
 vector<STrack> BirdEyeViewTracker::update(const vector<Object>& objects) {
     vector<STrack> output_tracks = BYTETracker::update(objects);
 
-    vector<BEVTrackPoint> bev_tracks;
-    bev_tracks.reserve(get_tracked_stracks().size() + get_lost_stracks().size());
-
-    appendTracksToBevInput(get_tracked_stracks(), TrackState::Tracked, bev_tracks);
-    appendTracksToBevInput(get_lost_stracks(), TrackState::Lost, bev_tracks);
-
     ++bev_frame_index_;
-    bev_renderer_.renderFrame(bev_tracks, bev_frame_index_);
+    bev_renderer_.renderFrame(get_tracked_stracks(), get_lost_stracks(), bev_frame_index_);
 
     return output_tracks;
 }
@@ -35,22 +29,4 @@ const BirdEyeViewRenderer& BirdEyeViewTracker::renderer() const {
 
 BirdEyeViewRenderer& BirdEyeViewTracker::renderer() {
     return bev_renderer_;
-}
-
-void BirdEyeViewTracker::appendTracksToBevInput(const vector<STrack>& tracks,
-                                                int expected_state,
-                                                vector<BEVTrackPoint>& bev_tracks) const {
-    for (size_t i = 0; i < tracks.size(); ++i) {
-        if (tracks[i].state != expected_state) {
-            continue;
-        }
-
-        BEVTrackPoint point;
-        point.track_id = tracks[i].track_id;
-        point.class_id = tracks[i].class_id;
-        point.gp = tracks[i].gp;
-        point.is_active = tracks[i].is_activated;
-        point.track_state = tracks[i].state;
-        bev_tracks.push_back(point);
-    }
 }

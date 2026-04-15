@@ -8,20 +8,10 @@
 
 #include "STrack.h"
 
-struct BEVTrackPoint {
-    int track_id = -1;
-    int class_id = -1;
-    std::string class_label;
-    cv::Point3f gp = cv::Point3f(0.0F, 0.0F, 0.0F);
-    bool is_active = true;
-    int track_state = TrackState::Tracked;
-};
-
 struct BEVRenderedTrackInfo {
     int frame_index = -1;
     int track_id = -1;
     int class_id = -1;
-    std::string class_label;
     cv::Point3f gp = cv::Point3f(0.0F, 0.0F, 0.0F);
     cv::Point2i bev_pixel = cv::Point2i(-1, -1);
     bool inside_bev = false;
@@ -38,7 +28,9 @@ public:
                         int padding_px = 50,
                         int grid_step_m = 10);
 
-    void renderFrame(const std::vector<BEVTrackPoint>& tracks, int frame_index);
+    void renderFrame(const std::vector<STrack>& tracked_stracks,
+                     const std::vector<STrack>& lost_stracks,
+                     int frame_index);
 
     cv::Point2i worldToImage(float x_m, float y_m, bool* inside = nullptr) const;
 
@@ -56,9 +48,9 @@ private:
     std::string frameOutputPath(int frame_index) const;
     cv::Mat buildCanvas() const;
     void drawGridAndAxes(cv::Mat& canvas) const;
-    void drawTrackPoint(cv::Mat& canvas, const BEVTrackPoint& track, int frame_index);
+    void drawTrackPoint(cv::Mat& canvas, const STrack& track, int frame_index);
     cv::Scalar getTrackColor(int track_id);
-    std::string resolveClassText(const BEVTrackPoint& track) const;
+    std::string resolveClassText(const STrack& track) const;
 
 private:
     std::string output_dir_;

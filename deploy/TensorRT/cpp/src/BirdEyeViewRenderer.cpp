@@ -44,13 +44,18 @@ BirdEyeViewRenderer::BirdEyeViewRenderer(const std::string& output_dir,
     ensureOutputDirectory(output_dir_);
 }
 
-void BirdEyeViewRenderer::renderFrame(const std::vector<BEVTrackPoint>& tracks, int frame_index) {
+void BirdEyeViewRenderer::renderFrame(const std::vector<STrack>& tracked_stracks,
+                                      const std::vector<STrack>& lost_stracks,
+                                      int frame_index) {
     cv::Mat canvas = buildCanvas();
     latest_rendered_tracks_.clear();
-    latest_rendered_tracks_.reserve(tracks.size());
+    latest_rendered_tracks_.reserve(tracked_stracks.size() + lost_stracks.size());
 
-    for (size_t i = 0; i < tracks.size(); ++i) {
-        drawTrackPoint(canvas, tracks[i], frame_index);
+    for (size_t i = 0; i < tracked_stracks.size(); ++i) {
+        drawTrackPoint(canvas, tracked_stracks[i], frame_index);
+    }
+    for (size_t i = 0; i < lost_stracks.size(); ++i) {
+        drawTrackPoint(canvas, lost_stracks[i], frame_index);
     }
 
     const std::string output_path = frameOutputPath(frame_index);
@@ -186,7 +191,7 @@ void BirdEyeViewRenderer::drawGridAndAxes(cv::Mat& canvas) const {
                 cv::LINE_AA);
 }
 
-void BirdEyeViewRenderer::drawTrackPoint(cv::Mat& canvas, const BEVTrackPoint& track, int frame_index) {
+void BirdEyeViewRenderer::drawTrackPoint(cv::Mat& canvas, const STrack& track, int frame_index) {
     bool inside = false;
     const cv::Point2i pixel = worldToImage(track.gp.x, track.gp.y, &inside);
     const cv::Scalar color = getTrackColor(track.track_id);
@@ -195,7 +200,6 @@ void BirdEyeViewRenderer::drawTrackPoint(cv::Mat& canvas, const BEVTrackPoint& t
     rendered.frame_index = frame_index;
     rendered.track_id = track.track_id;
     rendered.class_id = track.class_id;
-    rendered.class_label = track.class_label;
     rendered.gp = track.gp;
     rendered.bev_pixel = pixel;
     rendered.inside_bev = inside;
@@ -253,10 +257,7 @@ cv::Scalar BirdEyeViewRenderer::getTrackColor(int track_id) {
     return color;
 }
 
-std::string BirdEyeViewRenderer::resolveClassText(const BEVTrackPoint& track) const {
-    if (!track.class_label.empty()) {
-        return track.class_label;
-    }
+std::string BirdEyeViewRenderer::resolveClassText(const STrack& track) const {
     if (track.class_id >= 0) {
         return std::to_string(track.class_id);
     }
