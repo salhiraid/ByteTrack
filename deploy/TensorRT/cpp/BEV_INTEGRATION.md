@@ -1,37 +1,31 @@
-# BirdEyeViewTracker integration example
+# BEV mapping call location in `BYTETracker::update`
 
-`BirdEyeViewTracker` is a child class of `BYTETracker` and feeds BEV rendering directly with:
+The BEV mapping is now called **inside `BYTETracker::update`**, right after:
+
+```cpp
+this->lost_stracks.assign(resb.begin(), resb.end());
+```
+
+Then:
+
+```cpp
+if (bev_renderer.get() != nullptr)
+{
+    bev_frame_index++;
+    bev_renderer->renderFrame(this->tracked_stracks, this->lost_stracks, bev_frame_index);
+}
+```
+
+So each frame maps directly from tracker state vectors:
 
 - `vector<STrack> tracked_stracks`
 - `vector<STrack> lost_stracks`
 
-No object-level BEV input is used.
+## Enable mapping from `bytetrack.cpp`
 
 ```cpp
-#include "BirdEyeViewTracker.h"
-
-BirdEyeViewTracker tracker(
-    fps,
-    30,
-    "bev_outputs",  // output directory
-    -30.0f,          // configurable y min [m]
-    60.0f,           // configurable y max [m]
-    1000,
-    1000);
-
-vector<STrack> output_stracks = tracker.update(objects);
+BYTETracker tracker(fps, 30);
+tracker.enable_bev_mapping("bev_outputs", -30.0f, 60.0f, 1000, 1000);
 ```
 
-## Ground point format in `STrack`
-
-The BEV renderer reads `STrack::gp` directly, where `gp` is a `std::vector<float>`
-of size 2 containing world coordinates:
-
-- `gp[0]` -> `x` (meters)
-- `gp[1]` -> `y` (meters)
-
-Internally after each update:
-
-```cpp
-bev_renderer_.renderFrame(get_tracked_stracks(), get_lost_stracks(), bev_frame_index_);
-```
+`STrack::gp` is used directly and expected as `std::vector<float>{x, y}`.

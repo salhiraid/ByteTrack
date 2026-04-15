@@ -1,4 +1,5 @@
 #include "BYTETracker.h"
+#include "BirdEyeViewRenderer.h"
 #include <fstream>
 
 BYTETracker::BYTETracker(int frame_rate, int track_buffer)
@@ -8,6 +9,7 @@ BYTETracker::BYTETracker(int frame_rate, int track_buffer)
 	match_thresh = 0.8;
 
 	frame_id = 0;
+	bev_frame_index = 0;
 	max_time_lost = int(frame_rate / 30.0 * track_buffer);
 	cout << "Init ByteTrack!" << endl;
 }
@@ -229,6 +231,12 @@ vector<STrack> BYTETracker::update(const vector<Object>& objects)
 	this->tracked_stracks.assign(resa.begin(), resa.end());
 	this->lost_stracks.clear();
 	this->lost_stracks.assign(resb.begin(), resb.end());
+
+	if (bev_renderer.get() != nullptr)
+	{
+		bev_frame_index++;
+		bev_renderer->renderFrame(this->tracked_stracks, this->lost_stracks, bev_frame_index);
+	}
 	
 	for (int i = 0; i < this->tracked_stracks.size(); i++)
 	{
@@ -248,4 +256,16 @@ const vector<STrack>& BYTETracker::get_tracked_stracks() const
 const vector<STrack>& BYTETracker::get_lost_stracks() const
 {
 	return lost_stracks;
+}
+
+void BYTETracker::enable_bev_mapping(const string& output_dir,
+									 float y_min_m,
+									 float y_max_m,
+									 int canvas_width,
+									 int canvas_height,
+									 int padding_px,
+									 int grid_step_m)
+{
+	bev_renderer.reset(new BirdEyeViewRenderer(output_dir, y_min_m, y_max_m, canvas_width, canvas_height, padding_px, grid_step_m));
+	bev_frame_index = 0;
 }
